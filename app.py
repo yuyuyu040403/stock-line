@@ -5,7 +5,6 @@ import urllib.parse
 import warnings
 warnings.filterwarnings("ignore")
 
-# 【关键修复1】：启动时强制清除 Windows / VS Code 终端残留的加速器代理环境变量，防止关闭加速器后黑屏死锁
 for proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
     os.environ.pop(proxy_var, None)
 os.environ["NO_PROXY"] = "*"
@@ -13,6 +12,7 @@ os.environ["NO_PROXY"] = "*"
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -22,11 +22,13 @@ if get_script_run_ctx() is None:
     os.system(f'"{sys.executable}" -m streamlit run "{__file__}"')
     sys.exit()
 
-# 创建完全无视系统残留代理的纯净直连 Session（最适合香港本地宽带）
+# 创建带有自动重试机制的稳健 Session（有效应对云端 429 限流）
 DIRECT_SESSION = requests.Session()
 DIRECT_SESSION.trust_env = False
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+DIRECT_SESSION.mount('https://', HTTPAdapter(max_retries=retries))
+DIRECT_SESSION.mount('http://', HTTPAdapter(max_retries=retries))
 
-# 内置高频美股 SEC CIK 字典，免去每次合成板块时重复下载 10MB 索引表
 FAST_CIK_MAP = {
     "AAPL": "0000320193", "MSFT": "0000789019", "GOOGL": "0001652044", "GOOG": "0001652044",
     "AMZN": "0001018724", "META": "0001326801", "TSLA": "0001318605", "NVDA": "0001045810",
@@ -90,7 +92,6 @@ with st.sidebar:
 
     selected_sector = st.selectbox("1. 选择板块", list(SECTOR_DICT.keys()))
     sector_map = SECTOR_DICT[selected_sector]
-    # 默认 index=1 先加载单股保证页面1秒瞬开，需要合成大盘时再下拉选第1项
     default_idx = 1 if len(sector_map) > 1 else 0
     selected_label = st.selectbox("2. 选择板块内标的", list(sector_map.keys()), index=default_idx)
 
@@ -145,7 +146,7 @@ with st.sidebar:
     col_a, _ = st.columns(2)
     color_style = col_a.radio("K线配色", ["红涨", "绿涨"], index=0)
 
-    if st.button("🔄 刷新最新数据", use_container_width=True):
+    if st.button("🔄 刷新最新数据", width="stretch"):
         st.cache_data.clear()
 
 # ================= 4. 基础工具函数 =================
@@ -269,7 +270,6 @@ def get_sec_quarterly_financials(ticker: str, metric_choice: str, mode_str: str)
 
 
 def parse_csv_by_position(csv_text: str) -> pd.DataFrame:
-    """按列位置解析 CSV，兼容 FRED 最新 observation_date 表头"""
     df = pd.read_csv(io.StringIO(csv_text), na_values=[".", "", "NA", "null"])
     if df.shape[1] < 2:
         return pd.DataFrame()
@@ -281,11 +281,10 @@ def parse_csv_by_position(csv_text: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_direct"):
+def fetch_macro_data(indicator: str, prd_code: str):
     yf_prd = "max" if prd_code == "20y" else prd_code
     cutoff_date = pd.Timestamp.today().normalize()
     
-    # 1. 雅虎财经源 (美债、原油)
     if "美债" in indicator or "原油" in indicator:
         try:
             tk = yf.Ticker("^TNX" if "美债" in indicator else "BZ=F")
@@ -299,7 +298,6 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
         except Exception as e:
             return pd.DataFrame(), "", str(e)
         
-    # 2. 宏观通胀源 (CPI, PCE, PPI)
     fred_id_map = {
         "美国 CPI (消费者物价指数 YoY%)": "CPIAUCSL",
         "美国核心 PCE (美联储最爱 YoY%)": "PCEPILFE",
@@ -316,9 +314,8 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
     fred_csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_id}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # --- 通道 1: 香港本地宽带直连 FRED 官方 CSV ---
     try:
-        resp = DIRECT_SESSION.get(fred_csv_url, headers=headers, timeout=8)
+        resp = DIRECT_SESSION.get(fred_csv_url, headers=headers, timeout=10)
         if resp.status_code == 200 and "<html" not in resp.text[:200].lower():
             raw_df = parse_csv_by_position(resp.text)
             if not raw_df.empty:
@@ -328,7 +325,6 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
     except Exception as e:
         error_logs.append(f"FRED异常:{type(e).__name__}")
 
-    # --- 通道 2: DB.nomics 镜像库 ---
     if raw_df.empty:
         try:
             db_url = f"https://api.db.nomics.world/v22/series/FRED/{fred_id}?observations=1"
@@ -349,7 +345,6 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
         except Exception as e:
             error_logs.append(f"DB.nomics异常:{type(e).__name__}")
 
-    # --- 通道 3: Econdb 量化接口 (兜底 CPI/PPI) ---
     if raw_df.empty:
         eco_map = {"CPIAUCSL": "USCPI", "WPSFD49207": "USPPI"}
         if fred_id in eco_map:
@@ -366,7 +361,6 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
             except Exception as e:
                 error_logs.append(f"Econdb异常:{type(e).__name__}")
 
-    # 【数据加工】：计算同比通胀率 YoY%
     if not raw_df.empty:
         try:
             raw_df["Value"] = raw_df["Value"].pct_change(12) * 100 
@@ -392,7 +386,7 @@ def fetch_macro_data(indicator: str, prd_code: str, cache_ver: str = "v4_hk_dire
 def fetch_single_security(symbol, itv_raw, prd, metric_choice, mode_str):
     yf_prd = "max" if prd == "20y" else prd
     
-    tk = yf.Ticker(symbol)
+    tk = yf.Ticker(symbol, session=DIRECT_SESSION)
     raw_daily = tk.history(period=yf_prd, interval="1d", auto_adjust=True)
         
     if raw_daily.empty: return pd.DataFrame(), {}
@@ -404,7 +398,6 @@ def fetch_single_security(symbol, itv_raw, prd, metric_choice, mode_str):
     df = safe_resample(raw_daily, itv_raw)
     latest_close = float(df["Close"].iloc[-1])
     
-    # 优先使用极速 fast_info 获取股本与市值，避免 tk.info 卡顿
     shares, mcap_now = None, None
     try:
         f_info = tk.fast_info
@@ -509,7 +502,6 @@ def fetch_sector_aggregate(stock_dict, itv_raw, prd, metric_choice, mode_str, we
     fund_df = fund_df.ffill()
     val_df = val_df.ffill()
     
-    # 【关键修复2】：兼容所有 Pandas 版本的稳健 K 线合成写法
     agg_open = pd.concat(open_frames, axis=1).ffill().bfill().sum(axis=1)
     agg_high = pd.concat(high_frames, axis=1).ffill().bfill().sum(axis=1)
     agg_low = pd.concat(low_frames, axis=1).ffill().bfill().sum(axis=1)
@@ -647,6 +639,10 @@ if not macro_df.empty:
 else:
     st.error(f"⚠️ 无法获取宏观数据。底层诊断日志: `{err_msg}`")
 
+if target_symbol == "__SECTOR_AGG__":
+    st.markdown("---")
+    st.markdown(f"##### 📋 {selected_sector} - 估值明细表")
+    st.dataframe(sector_table_df, use_container_width=True, hide_index=True)
 if target_symbol == "__SECTOR_AGG__":
     st.markdown("---")
     st.markdown(f"##### 📋 {selected_sector} - 估值明细表")
