@@ -22,9 +22,14 @@ if get_script_run_ctx() is None:
     os.system(f'"{sys.executable}" -m streamlit run "{__file__}"')
     sys.exit()
 
-# 创建带有自动重试机制的稳健 Session（有效应对云端 429 限流）
+# 创建带有浏览器级 User-Agent 和自动重试机制的稳健 Session
 DIRECT_SESSION = requests.Session()
 DIRECT_SESSION.trust_env = False
+DIRECT_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5"
+})
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 DIRECT_SESSION.mount('https://', HTTPAdapter(max_retries=retries))
 DIRECT_SESSION.mount('http://', HTTPAdapter(max_retries=retries))
@@ -287,7 +292,7 @@ def fetch_macro_data(indicator: str, prd_code: str):
     
     if "美债" in indicator or "原油" in indicator:
         try:
-            tk = yf.Ticker("^TNX" if "美债" in indicator else "BZ=F")
+            tk = yf.Ticker("^TNX" if "美债" in indicator else "BZ=F", session=DIRECT_SESSION)
             df = tk.history(period=yf_prd)
             if not df.empty:
                 df = df[["Close"]].rename(columns={"Close": "Value"})
@@ -528,7 +533,7 @@ def fetch_sector_aggregate(stock_dict, itv_raw, prd, metric_choice, mode_str, we
         "price": latest_c,
         "pct_change": (latest_c - float(agg_df["Close"].iloc[-2])) / float(agg_df["Close"].iloc[-2]) * 100 if len(agg_df) > 1 else 0.0,
         "mcap_b": mcap_df.sum(axis=1).iloc[-1] / 1e9,
-        "val_multiple": float(agg_df["Val_Metric_Annualized"].dropna().iloc[-1]) if not agg_df["Val_Metric_Annualized"].dropna().empty else None,
+        "val_multiple": float(agg_df["Val_Metric_Annualized"].iloc[-1]) if not pd.isna(agg_df["Val_Metric_Annualized"].iloc[-1]) else None,
         "metric_name": metric_choice.split(" ")[0],
         "fundamental_name": "加权权益" if is_pb else ("加权营收" if "P/S" in metric_choice else "加权净利")
     }, pd.DataFrame(table_rows)
@@ -639,10 +644,6 @@ if not macro_df.empty:
 else:
     st.error(f"⚠️ 无法获取宏观数据。底层诊断日志: `{err_msg}`")
 
-if target_symbol == "__SECTOR_AGG__":
-    st.markdown("---")
-    st.markdown(f"##### 📋 {selected_sector} - 估值明细表")
-    st.dataframe(sector_table_df, use_container_width=True, hide_index=True)
 if target_symbol == "__SECTOR_AGG__":
     st.markdown("---")
     st.markdown(f"##### 📋 {selected_sector} - 估值明细表")
